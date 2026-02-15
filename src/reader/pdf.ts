@@ -17,8 +17,6 @@ let intentStatesPrototype: any;
 
 let firstRenderTriggered = false;
 
-let isWordBroken = false;
-
 function main() {
   patchIntentStatesGet();
 
@@ -72,7 +70,13 @@ function patchRenderTasksAdd(renderTasks: Set<InternalRenderTask>) {
     wait
       .waitUtilAsync(() => renderTask.gfx, 100, 10000)
       .then(() => {
-        patchCanvasGraphicsShowText(renderTask.gfx.__proto__);
+        // Initialize bionic state for this specific renderTask
+        if (!(renderTask as any)._bionicState) {
+          (renderTask as any)._bionicState = {
+            boldRemainingChars: 0,
+          };
+        }
+        patchCanvasGraphicsShowText(renderTask.gfx.__proto__, renderTask);
         renderTasks.add = original_add;
         unPatchIntentStatesGet();
       });
@@ -84,6 +88,11 @@ function patchCanvasGraphicsShowText(
   canvasGraphicsPrototype: typeof CanvasGraphics & {
     __showTextPatched?: boolean;
     ctx: CanvasRenderingContext2D;
+  },
+  renderTask: InternalRenderTask & {
+    _bionicState?: {
+      boldRemainingChars: number;
+    };
   },
 ) {
   if (canvasGraphicsPrototype.__showTextPatched) {
@@ -116,7 +125,13 @@ function patchCanvasGraphicsShowText(
       weightOffset,
     });
 
-    const newGlyphData = computeBionicGlyphs(glyphs);
+    const bionicState = renderTask._bionicState!;
+    const { newGlyphData, updatedState } = computeBionicGlyphs(
+      glyphs,
+      bionicState,
+    );
+    // Update the bionic state on the renderTask for the next call
+    renderTask._bionicState = updatedState;
 
     for (const { glyphs: newG, isBold } of newGlyphData) {
       this.ctx.font = isBold ? bold.font : light.font;
@@ -137,10 +152,10 @@ function patchCanvasGraphicsShowText(
   }
 }
 
-function computeBionicGlyphs(glyphs: Glyph[]) {
-  let wordStartIdx = NaN;
-  let wordEndIdx = NaN;
-  let word = "";
+function computeBionicGlyphs(
+  glyphs: Glyph[],
+  currentState: { boldRemainingChars: number },
+) {
   const newGlyphData: {
     glyphs: Glyph[];
     isBold: boolean;
@@ -148,148 +163,62 @@ function computeBionicGlyphs(glyphs: Glyph[]) {
 
   const parsingOffset = window.__BIONIC_PARSING_OFFSET || 0;
 
-  // From text-vide
-  const CONVERTIBLE_REGEX = /(\p{L}|\p{Nd})*\p{L}(\p{L}|\p{Nd})*/u;
-
-  const NON_VOWELS_REGEX = /[^aeiou]/gi;
-
-  // Use a regex to match all non-alphanumeric characters, e.g. space, punctuation, etc.
-  // But should not match other unicode characters like emojis or cjks
-  const SEPARATOR_REGEX = /[\p{P}\p{S}\p{Z}]/u;
+  // Regex for major segment endings (periods, question marks, exclamation points, ellipsis)
+  const MAJOR_SEGMENT_PUNCTUATION_REGEX = /[.?!\u2026]/u;
+  // Regex for space or zero-width space (from <EMPTY>)
+  const SPACE_OR_EMPTY_REGEX = / |\u2060/u;
 
   function getStr(glyph: Glyph) {
     if (typeof glyph === "number") {
       if (glyph < -100) {
-        return " ";
+        return " "; // Represents a space or line break
       } else {
-        return "<EMPTY>";
+        return "<EMPTY>"; // Represents an empty glyph, often zero-width space
       }
     }
     return glyph.unicode;
   }
 
+  // Use local state variable for this chunk processing, initialized from currentState
+  let boldRemainingChars = currentState.boldRemainingChars;
+
   for (let i = 0; i < glyphs.length; i++) {
     const glyph = glyphs[i];
     const str = getStr(glyph);
-    const isWordSeparator = SEPARATOR_REGEX.test(str);
+    let isBold = false;
 
-    const isWordStarted = !Number.isNaN(wordStartIdx);
-    if (isWordStarted) {
-      if (isWordSeparator || i === glyphs.length - 1) {
-        // If the word has started and we encounter a space, the word has ended
-        wordEndIdx = i;
-        word += str;
-        _log(`Word ended: ${wordStartIdx} ${wordEndIdx}`);
-      } else {
-        // If the word has started and we encounter a non-space, the word has not ended
-        word += str;
-        continue;
-      }
+    // If we are currently in an offset-bolding sequence after a sentence ending
+    if (boldRemainingChars > 0) {
+      isBold = true;
+      boldRemainingChars--;
     } else {
-      if (!isWordSeparator) {
-        // If the word has not started and we encounter a non-space, the word has started
-        wordStartIdx = i;
-        word += str;
-        _log(`Word started: ${wordStartIdx}`);
-      } else {
-        // If the word has not started and we encounter a space, the word has not started
-        newGlyphData.push({
-          glyphs: glyphs.slice(i, i + 1),
-          isBold: false,
-        });
-        continue;
-      }
-    }
-    const isWordEnded = isWordStarted && !Number.isNaN(wordEndIdx);
-    if (!isWordEnded) {
-      continue;
-    }
+      // Not currently bolding by offset, check if this character triggers new bolding
+      const nextStr = i + 1 < glyphs.length ? getStr(glyphs[i + 1]) : null;
 
-    // If the word has ended, bolden the first alphabet of the word
-    // const word = showTextArgs.slice(wordStartIdx, wordEndIdx).map((arg) => {
-    //     return arg.unicode;
-    // }).join("");
-    _log(`Boldening word: ${wordStartIdx} ${wordEndIdx}`, word);
-
-    word = word.replace(/<EMPTY>/g, "\u2060");
-
-    if (wordEndIdx === wordStartIdx || !CONVERTIBLE_REGEX.test(word)) {
-      newGlyphData.push({
-        glyphs: glyphs.slice(wordStartIdx, wordEndIdx + 1),
-        isBold: false,
-      });
-      wordStartIdx = NaN;
-      wordEndIdx = NaN;
-      word = "";
-      continue;
-    }
-
-    let boldNumber = 1;
-
-    const wordLength = wordEndIdx + 1 - wordStartIdx;
-    const isPreviousWordBroken = isWordBroken;
-    isWordBroken =
-      word.endsWith("\u2060") && wordLength >= 1 && wordLength <= 10;
-    // If the word ends with a zero-width space, it may be broken
-    if (isPreviousWordBroken && !isWordBroken) {
-      // If the previous word was broken and the current word is not broken, skip boldening
-      boldNumber = 0;
-      isWordBroken = false;
-    } else if (isWordBroken) {
-      // If the word is broken, bolden the entire word as it is the first part
-      _log("The word may be broken", word.slice(wordStartIdx, wordEndIdx + 1));
-      boldNumber = wordLength;
-    } else if (wordLength < 4) {
-      boldNumber = 1;
-    } else {
-      boldNumber = Math.ceil(wordLength / 2);
-
-      if (boldNumber > 6) {
-        // Find the closest non-vowel character to the bold number
-        const nonVowels = word.matchAll(NON_VOWELS_REGEX);
-        const closestMatch = Array.from(nonVowels).sort((a, b) => {
-          return (
-            Math.abs(a.index! - boldNumber) - Math.abs(b.index! - boldNumber)
-          );
-        })[0];
-        if (closestMatch && Math.abs(closestMatch.index - boldNumber) < 2) {
-          boldNumber = closestMatch.index! + 1;
+      // Check for sentence-ending punctuation
+      if (MAJOR_SEGMENT_PUNCTUATION_REGEX.test(str)) {
+        isBold = true; // The punctuation itself is bolded
+        // Apply offset if followed by a space or zero-width space
+        if (nextStr && SPACE_OR_EMPTY_REGEX.test(nextStr)) {
+          boldRemainingChars = (parsingOffset || 0) + 5;
+        } else if (nextStr === null) {
+          // If punctuation is the last character in the chunk, assume it's followed by a space
+          boldRemainingChars = (parsingOffset || 0) + 5;
         }
       }
     }
 
-    boldNumber += parsingOffset;
-
-    // Clamp the bold number to the word length
-    boldNumber = Math.max(Math.min(boldNumber, wordLength), 1);
-
-    _log("Word length", wordLength, boldNumber);
-
     newGlyphData.push({
-      glyphs: glyphs.slice(wordStartIdx, wordStartIdx + boldNumber),
-      isBold: true,
-    });
-
-    if (wordStartIdx + boldNumber <= wordEndIdx) {
-      newGlyphData.push({
-        glyphs: glyphs.slice(wordStartIdx + boldNumber, wordEndIdx + 1),
-        isBold: false,
-      });
-    }
-
-    wordStartIdx = NaN;
-    wordEndIdx = NaN;
-    word = "";
-  }
-
-  // If the last word has not ended, push it
-  if (!Number.isNaN(wordStartIdx)) {
-    newGlyphData.push({
-      glyphs: glyphs.slice(wordStartIdx, wordStartIdx + glyphs.length),
-      isBold: false,
+      glyphs: glyphs.slice(i, i + 1),
+      isBold: isBold,
     });
   }
-  return newGlyphData;
+
+  // Return the updated state to be stored on the renderTask for the next call
+  return {
+    newGlyphData,
+    updatedState: { boldRemainingChars: boldRemainingChars },
+  };
 }
 
 function refresh() {
