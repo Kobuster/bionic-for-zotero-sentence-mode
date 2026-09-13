@@ -171,7 +171,7 @@ function computeBionicGlyphs(
   const parsingOffset = window.__BIONIC_PARSING_OFFSET || 0;
 
   // Regex for major segment endings (periods, question marks, exclamation points, ellipsis)
-  const MAJOR_SEGMENT_PUNCTUATION_REGEX = /[.?!\u2026]/u;
+  const MAJOR_SEGMENT_PUNCTUATION_REGEX = /[:;,.?!\u2026]/u;
   // Regex for space or zero-width space (from <EMPTY>)
   const SPACE_OR_EMPTY_REGEX = / |\u2060/u;
 
